@@ -54,6 +54,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, config.n_embd * 4)
         self.gelu = nn.GELU(approximate="tanh")
         self.c_proj = nn.Linear(config.n_embd * 4, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -106,6 +107,23 @@ class GPT(nn.Module):
         )
         # lm_head: language model head
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # init params
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, "NANOGPT_SCALE_INIT"):
+                std *= (2 * self.config.n_layer) ** -0.5
+            nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
         # idx is of shape (B, T)
@@ -193,16 +211,70 @@ class GPT(nn.Module):
 
 
 # ------------------------------------------------------------------------------------------------
+import tiktoken
+
+
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        # at init load tokens from disk and store in memory
+        with open("input.txt", "r") as f:
+            text = f.read()
+        enc = tiktoken.get_encoding("gpt2")
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)  # (N,)
+        print("loaded tokens of shape", self.tokens.shape)
+        print(f" 1 epoch = {len(self.tokens) // (B * T)} batches")
+
+        self.current_position = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position + B * T + 1]
+        x = buf[:-1].view(B, T)  # inputs
+        y = buf[1:].view(B, T)  # targets
+        # advance the position in the tensor
+        self.current_position += B * T
+        # if loading the next batch would overrun the tokens tensor, reset the position
+        if self.current_position + B * T + 1 > len(self.tokens):
+            self.current_position = 0
+        return x, y
+
+
+# ------------------------------------------------------------------------------------------------
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = "mps"
+print("using device:", device)
+
 num_return_sequences = 5
 max_length = 30
-device = "cpu"
 
-model = GPT.from_pretrained("gpt2")
-model.eval()
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
+train_loader = DataLoaderLite(B=4, T=32)
+
+# get logits
+model = GPT(GPTConfig())
 model.to(device)
+# logits, loss = model(x, y)
 
-# Prefix tokens
-import tiktoken
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"step {i}, loss: {loss.item()}")
+
 
 enc = tiktoken.get_encoding("gpt2")
 tokens = enc.encode("Hello, I'm a language model,")
@@ -211,9 +283,6 @@ tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)  # (5, 8)
 x = tokens.to(device)
 
 # generate! right now x is (B, T) where B = 5, T = 8
-# set the seed to 42
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
 while x.size(1) < max_length:
     # forward to model to get the logits
     with torch.no_grad():
