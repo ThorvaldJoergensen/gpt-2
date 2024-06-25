@@ -1,0 +1,6 @@
+transformers
+matplotlib
+torch
+tiktoken
+numpy<2.0.0
+pandas
